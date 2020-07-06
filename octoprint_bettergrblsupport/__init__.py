@@ -64,7 +64,7 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
         self.grblPowerLevel = 0
         self.positioning = 0
         self.marlin_control = True
-
+        self.fanSpeed = 0
         self.timeRef = 0
 
         self.grblErrors = {}
@@ -982,10 +982,15 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
                 self._printer.commands("G0 E{}".format(distance * -1))
 
             if direction == "F+":
-                self._printer.commands("M106 S255")
+                self.fanSpeed += 32
+                if self.fanSpeed > 255:
+                    self.fanSpeed = 255
+                self._printer.commands("M106 S{}".format(self.fanSpeed))
             if direction == "F-":
-                self._printer.commands("M106 S0")
-                self._printer.commands("M107")
+                self.fanSpeed -= 32
+                if self.fanSpeed < 0:
+                    self.fanSpeed = 0
+                self._printer.commands("M106 S{}".format(self.fanSpeed))
             return
 
         if command == "origin":
