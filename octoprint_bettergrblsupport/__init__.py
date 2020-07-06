@@ -15,6 +15,8 @@ import re
 import logging
 import json
 import flask
+import inspect
+import threading
 
 class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
                               octoprint.plugin.SimpleApiPlugin,
@@ -56,9 +58,12 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
         self.grblX = float(0)
         self.grblY = float(0)
         self.grblZ = float(0)
+        self.grblE = float(0)
+        self.grblF = float(0)
         self.grblSpeed = 0
         self.grblPowerLevel = 0
         self.positioning = 0
+        self.marlin_control = True
 
         self.timeRef = 0
 
@@ -66,10 +71,21 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
         self.grblAlarms = {}
         self.grblSettingsNames = {}
         self.grblSettings = {}
-
+        self.pollingThread = None
+        self.pollingInterval = 5000
         self.ignoreErrors = False
 
         self.customControlsJson = r'[{"layout": "horizontal", "children": [{"commands": ["$10=0", "G28.1", "G92 X0 Y0 Z0"], "name": "Set Origin", "confirm": null}, {"command": "M999", "name": "Reset", "confirm": null}, {"commands": ["G1 F4000 S0", "M5", "$SLP"], "name": "Sleep", "confirm": null}, {"command": "$X", "name": "Unlock", "confirm": null}, {"commands": ["$32=0", "M4 S1"], "name": "Weak Laser", "confirm": null}, {"commands": ["$32=1", "M5"], "name": "Laser Off", "confirm": null}], "name": "Laser Commands"}, {"layout": "vertical", "type": "section", "children": [{"regex": "<([^,]+)[,|][WM]Pos:([+\\-\\d.]+,[+\\-\\d.]+,[+\\-\\d.]+)", "name": "State", "default": "", "template": "State: {0} - Position: {1}", "type": "feedback"}, {"regex": "F([\\d.]+) S([\\d.]+)", "name": "GCode State", "default": "", "template": "Speed: {0}  Power: {1}", "type": "feedback"}], "name": "Realtime State"}]'
+
+    def debug(self, msg):
+        self._logger.info("{} {}:{}".format(time.time(), inspect.currentframe().f_back.f_lineno, msg))
+
+    def pollingFunc(self):
+        while (self._printer.is_operational()):
+            if not self.disablePolling or not self._printer.is_printing():
+                self._printer.commands(self.positionCommand)
+            time.sleep(self.pollingInterval / 1000.0)
+        self.debug("Printer not operational. Ending status polling.")
 
     # #~~ SettingsPlugin mixin
     def get_settings_defaults(self):
@@ -329,12 +345,22 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
             return
 
         if event == Events.CONNECTED:
-            if "0.9" in self.grblVersion:
-                self._printer.commands("$10=2")  # set status report to WPos
-            if "1.1" in self.grblVersion:
-                self._printer.commands("$10=0")  # set status report to WPos
+            if self.marlin_control:
 
-        # 'PrintStarted'
+                # init settings for marlin
+                self.pollingThread = threading.Thread(target=self.pollingFunc)
+                self.pollingThread.start()
+                self._printer.commands("M17 X Y Z E")  # enable steppers
+#                self._printer.commands("G91")  # relative moves
+                self._printer.commands("M302 P1")  # disable cold extrusion checking
+            else:
+                if "0.9" in self.grblVersion:
+                    self._printer.commands("$10=2")  # set status report to WPos
+                if "1.1" in self.grblVersion:
+                    self._printer.commands("$10=0")  # set status report to WPos
+
+
+            # 'PrintStarted'
         if event == Events.PRINT_STARTED:
             self.grblState = "Run"
             return
@@ -421,6 +447,16 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
 
     # #-- gcode sending hook
     def hook_gcode_sending(self, comm_instance, phase, cmd, cmd_type, gcode, *args, **kwargs):
+        self.debug("Sending: {}".format(cmd))
+
+        if self.marlin_control:
+            self.positionCommand = "M114"
+            if "$H" in cmd:
+                return ("G28",)
+
+            # if "G0" in cmd:
+            #     cmd = cmd.replace("G91 ", "")
+            return (cmd,)
 
         # M8 processing - work in progress
         if cmd.upper().strip() == "M8" and self.overrideM8:
@@ -559,6 +595,8 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
                                                                                     x=self.grblX,
                                                                                     y=self.grblY,
                                                                                     z=self.grblZ,
+                                                                                    e=self.grblE,
+                                                                                    f=self.grblF,
                                                                                     speed=self.grblSpeed,
                                                                                     power=self.grblPowerLevel))
                     self.timeRef = currentTime
@@ -571,6 +609,30 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
     # original author:  https://github.com/mic159
     # source: https://github.com/mic159/octoprint-grbl-plugin)
     def hook_gcode_received(self, comm_instance, line, *args, **kwargs):
+
+        if self.marlin_control:
+#            self.debug("Received: {}".format(line))
+            match = re.search(r'X:(-?[\d\.]+)\sY:(-?[\d\.]+)\sZ:(-?[\d\.]+)\sE:(-?[\d\.]+)', line)
+            if not match is None:
+                self.grblX = float(match.groups(1)[0])
+                self.grblY = float(match.groups(1)[1])
+                self.grblZ = float(match.groups(1)[2])
+                self.grblE = float(match.groups(1)[3])
+                self.grblState = "None"
+                self.grblVersion = "Marlin"
+                self._plugin_manager.send_plugin_message(self._identifier, dict(type="grbl_state",
+                                                                                grblVersion=self.grblVersion,
+                                                                                state=self.grblState,
+                                                                                x=self.grblX,
+                                                                                y=self.grblY,
+                                                                                z=self.grblZ,
+                                                                                e=self.grblE,
+                                                                                f=self.grblF,
+                                                                                speed=self.grblSpeed,
+                                                                                power=self.grblPowerLevel))
+
+            return 'ok'
+
 
         if line.startswith('Grbl'):
              match = re.search(r'Grbl (\S*)', line)
@@ -655,32 +717,22 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
             self.grblY = float(match.groups(1)[2])
             self.grblZ = float(match.groups(1)[3])
 
-            if self.grblState == "Sleep" or self.grblState == "Run":
-                self._plugin_manager.send_plugin_message(self._identifier, dict(type="grbl_state",
-                                                                                grblVersion=self.grblVersion,
-                                                                                state=self.grblState,
-                                                                                x=self.grblX,
-                                                                                y=self.grblY,
-                                                                                z=self.grblZ,
-                                                                                speed=self.grblSpeed,
-                                                                                power=self.grblPowerLevel))
-
-            return response
-
         match = re.search(r"F(-?[\d.]+) S(-?[\d.]+)", line)
 
         if not match is None:
             self.grblSpeed = round(float(match.groups(1)[0]))
             self.grblPowerLevel = round(float(match.groups(1)[1]))
 
-            self._plugin_manager.send_plugin_message(self._identifier, dict(type="grbl_state",
-                                                                            grblVersion=self.grblVersion,
-                                                                            state=self.grblState,
-                                                                            x=self.grblX,
-                                                                            y=self.grblY,
-                                                                            z=self.grblZ,
-                                                                            speed=self.grblSpeed,
-                                                                            power=self.grblPowerLevel))
+        self._plugin_manager.send_plugin_message(self._identifier, dict(type="grbl_state",
+                                                                        grblVersion=self.grblVersion,
+                                                                        state=self.grblState,
+                                                                        x=self.grblX,
+                                                                        y=self.grblY,
+                                                                        z=self.grblZ,
+                                                                        e=self.grblE,
+                                                                        f=self.grblF,
+                                                                        speed=self.grblSpeed,
+                                                                        power=self.grblPowerLevel))
 
         if not line.rstrip().endswith('ok'):
             return line
@@ -898,25 +950,42 @@ class BetterGrblSupportPlugin(octoprint.plugin.SettingsPlugin,
             self._logger.debug("move {} {}".format(direction, distance))
 
             if direction == "home":
-                self._printer.commands("G90 G0 X0 Y0")
+                self._printer.commands("G90")
+                self._printer.commands("G0 X0 Y0")
 
             if direction == "forward":
-                self._printer.commands("G91 G0 Y{}".format(distance))
-
+                self._printer.commands("G91")
+                self._printer.commands("G0 Y{}".format(distance))
             if direction == "backward":
-                self._printer.commands("G91 G0 Y{}".format(distance * -1))
+                self._printer.commands("G91")
+                self._printer.commands("G0 Y{}".format(distance * -1))
 
             if direction == "left":
-                self._printer.commands("G91 G0 X{}".format(distance * -1))
-
+                self._printer.commands("G91")
+                self._printer.commands("G0 X{}".format(distance * -1))
             if direction == "right":
-                self._printer.commands("G91 G0 X{}".format(distance))
+                self._printer.commands("G91")
+                self._printer.commands("G0 X{}".format(distance))
 
             if direction == "up":
-                self._printer.commands("G91 G0 Z{}".format(distance))
-
+                self._printer.commands("G91")
+                self._printer.commands("G0 Z{}".format(distance))
             if direction == "down":
-                self._printer.commands("G91 G0 Z{}".format(distance * -1))
+                self._printer.commands("G91")
+                self._printer.commands("G0 Z{}".format(distance * -1))
+
+            if direction == "E+":
+                self._printer.commands("G91")
+                self._printer.commands("G0 E{}".format(distance))
+            if direction == "E-":
+                self._printer.commands("G91")
+                self._printer.commands("G0 E{}".format(distance * -1))
+
+            if direction == "F+":
+                self._printer.commands("M106 S255")
+            if direction == "F-":
+                self._printer.commands("M106 S0")
+                self._printer.commands("M107")
             return
 
         if command == "origin":
